@@ -11,20 +11,17 @@ def channel_shuffle(x, groups):
     batchsize, num_channels, height, width = x.data.size()
     channels_per_group = num_channels // groups
     
-    # reshape
     x = x.view(batchsize, groups, channels_per_group, height, width)
     x = torch.transpose(x, 1, 2).contiguous()
-    # flatten
     return x.view(batchsize, -1, height, width)
 
-# MKDC 模块：多尺度特征提取核心
+# MKDC 模块：多尺度特征提取核心 (丰富语义信息)
 class MKDC(nn.Module):
     def __init__(self, in_channels, kernel_sizes=[1, 3, 5]):
         super(MKDC, self).__init__()
         self.dwconvs = nn.ModuleList([
             nn.Sequential(
                 # 深度可分离卷积 (groups=in_channels)
-                # 保持输入输出通道一致，方便后续拼接
                 nn.Conv2d(in_channels, in_channels, k, padding=k//2, groups=in_channels, bias=False),
                 nn.BatchNorm2d(in_channels),
                 nn.ReLU6(inplace=True)
@@ -32,19 +29,15 @@ class MKDC(nn.Module):
         ])
 
     def forward(self, x):
-        # 1. 并行计算并拼接 (Concat)
-        # 这里的输出通道数 = 输入通道数 * 卷积核数量(3)
+        # 并行计算并拼接
         out = torch.cat([dw(x) for dw in self.dwconvs], dim=1)
-        
-        # 2. 通道洗牌
-        # groups 必须等于分支的数量 (这里是 3)
+        # 通道洗牌，groups等于分支的数量
         return channel_shuffle(out, groups=len(self.dwconvs)) 
 
 # MKIR 模块：多核倒置残差块
 class MKIR(nn.Module):
     def __init__(self, in_c, out_c, expansion_factor=2, kernel_sizes=[1, 3, 5]):
         super(MKIR, self).__init__()
-        # 中间层的通道数 (升维)
         ex_c = in_c * expansion_factor
         
         # 1. 升维 (1x1 Conv)
@@ -57,22 +50,19 @@ class MKIR(nn.Module):
         # 2. 多核深度卷积 (MKDC)
         self.mkdc = MKDC(ex_c, kernel_sizes=kernel_sizes)
         
-        # 🔥【关键修复点】计算 MKDC 输出后的总通道数
-        # 因为 MKDC 使用了 concat，所以通道数翻了 len(kernel_sizes) 倍
+        # 计算 MKDC 输出后的总通道数
         mkdc_out_c = ex_c * len(kernel_sizes)
         
         # 3. 降维 (1x1 Conv)
-        # 输入必须匹配 MKDC 的输出通道数 (mkdc_out_c)
         self.pconv2 = nn.Sequential(
             nn.Conv2d(mkdc_out_c, out_c, 1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
         
-        # 4. 残差连接
+        # 4. 残差连接 (匹配维度)
         self.skip = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
 
     def forward(self, x):
-        # 残差结构: F(x) + x
         return self.pconv2(self.mkdc(self.pconv1(x))) + self.skip(x)
 
 # ==========================================
@@ -86,7 +76,6 @@ class ChannelAttention(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-        # 这里的 ratio=16 可能会让通道数变得太小，加上 max(1, ...) 保护
         reduced_planes = max(1, in_planes // ratio)
         
         self.fc1 = nn.Conv2d(in_planes, reduced_planes, 1, bias=False)
@@ -104,7 +93,6 @@ class ChannelAttention(nn.Module):
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
-        # 使用7x7大核卷积
         self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
@@ -114,7 +102,7 @@ class SpatialAttention(nn.Module):
         x_cat = torch.cat([avg_out, max_out], dim=1)
         return self.sigmoid(self.conv(x_cat))
 
-# MKIRA: 多核倒置残差注意力模块 (用于解码器)
+# MKIRA: 多核倒置残差注意力模块 
 class MKIRA(nn.Module):
     def __init__(self, in_c, out_c):
         super(MKIRA, self).__init__()
@@ -128,20 +116,21 @@ class MKIRA(nn.Module):
         x = self.mkir(x)   # 特征提取与降维
         return x
 
-# GAG: 分组注意力门 (用于跳跃连接)
+# 导师修改版 GAG: 标准注意力门 (Attention Gate)
+# 去除了容易报错的 groups=2，改用 1x1 卷积，更轻量且更符合学术标准
 class GAG(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super(GAG, self).__init__()
         self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=3, padding=1, groups=2, bias=True),
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
             nn.BatchNorm2d(F_int)
         )
         self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=3, padding=1, groups=2, bias=True),
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
             nn.BatchNorm2d(F_int)
         )
         self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, bias=True),
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
             nn.BatchNorm2d(1),
             nn.Sigmoid()
         )
@@ -152,10 +141,11 @@ class GAG(nn.Module):
         x1 = self.W_x(x)
         psi = self.relu(g1 + x1)
         psi = self.psi(psi)
+        # 返回被注意力门过滤后的跳跃连接特征
         return x * psi 
 
 # ==========================================
-# 3. U-Net 改进版组件与主类
+# 3. MK-UNet 主类
 # ==========================================
 
 # 改进后的下采样块
@@ -175,65 +165,71 @@ class ImprovedDownBlock(nn.Module):
 class ImprovedUpBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ImprovedUpBlock, self).__init__()
-        # 双线性插值
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        # GAG模块
+        # 修正的 GAG 模块
         self.gag = GAG(F_g=in_channels, F_l=out_channels, F_int=out_channels // 2)
-        
-        # MKIRA模块
-        # 输入通道 = 上层输出(in_channels) + 跳跃连接(out_channels)
+        # 拼接后通道数为 in_channels + out_channels
         self.mkira = MKIRA(in_channels + out_channels, out_channels)
 
     def forward(self, x, skip):
         x = self.up(x)
+        # 用解码层特征 (g=x) 去过滤编码层特征 (x=skip)
         skip = self.gag(g=x, x=skip) 
         x = torch.cat([x, skip], dim=1)
         x = self.mkira(x)
         return x
 
-# 最终模型类
+# 最终创新模型类: Improved MK-UNet
+# ... (保留之前文件上半部分的 MKDC, MKIR, GAG, MKIRA, ImprovedDownBlock, ImprovedUpBlock 等定义) ...
+
 class ImprovedUNet(nn.Module):
     def __init__(self, n_channels=3, n_classes=1):
         super(ImprovedUNet, self).__init__()
-        # 轻量化通道配置
         filters = [16, 32, 64, 96, 160] 
 
-        # 编码器
+        # 编码器与瓶颈层保持不变
         self.down1 = ImprovedDownBlock(n_channels, filters[0])
         self.down2 = ImprovedDownBlock(filters[0], filters[1])
         self.down3 = ImprovedDownBlock(filters[1], filters[2])
         self.down4 = ImprovedDownBlock(filters[2], filters[3])
-
-        # 瓶颈层
         self.bottleneck = MKIR(filters[3], filters[4])
 
-        # 解码器
+        # 解码器保持不变
         self.up1 = ImprovedUpBlock(filters[4], filters[3])
         self.up2 = ImprovedUpBlock(filters[3], filters[2])
         self.up3 = ImprovedUpBlock(filters[2], filters[1])
         self.up4 = ImprovedUpBlock(filters[1], filters[0])
 
-        # 输出层
-        self.outc = nn.Conv2d(filters[0], n_classes, 1)
+        # 🔥 深度监督核心：新增辅助分类头 (Auxiliary Classifiers)
+        self.outc_up2 = nn.Conv2d(filters[2], n_classes, 1) # 中间层2输出
+        self.outc_up3 = nn.Conv2d(filters[1], n_classes, 1) # 中间层3输出
+        self.outc_main = nn.Conv2d(filters[0], n_classes, 1) # 最终主输出
 
     def forward(self, x):
-        # 编码
+        # 编码与瓶颈
         x1, skip1 = self.down1(x)
         x2, skip2 = self.down2(x1)
         x3, skip3 = self.down3(x2)
         x4, skip4 = self.down4(x3)
-
-        # 瓶颈
         x5 = self.bottleneck(x4)
 
-        # 解码
-        x = self.up1(x5, skip4)
-        x = self.up2(x, skip3)
-        x = self.up3(x, skip2)
-        x = self.up4(x, skip1)
+        # 解码与辅助特征提取
+        x_up1 = self.up1(x5, skip4)
+        x_up2 = self.up2(x_up1, skip3)
+        x_up3 = self.up3(x_up2, skip2)
+        x_up4 = self.up4(x_up3, skip1)
 
-        return torch.sigmoid(self.outc(x))
+        # 最终的主输出
+        out_main = torch.sigmoid(self.outc_main(x_up4))
+
+        # 🔥 如果是训练模式，同时返回中间层的预测结果进行深度监督
+        if self.training:
+            out_up2 = torch.sigmoid(self.outc_up2(x_up2))
+            out_up3 = torch.sigmoid(self.outc_up3(x_up3))
+            return out_main, out_up2, out_up3
+        
+        # 如果是评估/推理模式，只返回最终最高精度的输出，节省显存
+        return out_main
 
 if __name__ == '__main__':
     # 测试代码

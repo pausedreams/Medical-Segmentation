@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,14 +6,11 @@ import matplotlib.pyplot as plt
 from pycocotools.coco import COCO
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
-import random
 import swanlab
-import numpy as np
-from net import UNet
-# 如果您使用的是改进版，请确保这里导入的是正确的模型类，例如:
-from MK_net import ImprovedUNet 
-from data import COCOSegmentationDataset
 
+# 仅导入基线模型和数据集
+from model_unet import UNet
+from dataset import COCOSegmentationDataset
 
 # ================= 配置区域 =================
 # 数据路径设置
@@ -25,7 +23,7 @@ test_annotation_file = './dataset/Brain_Tumor_Image_DataSet/test/_annotations.co
 val_annotation_file = './dataset/Brain_Tumor_Image_DataSet/valid/_annotations.coco.json'
 # ===========================================
 
-# 定义损失函数
+# 定义损失函数 (Dice + BCE 联合损失，很棒的设计)
 def dice_loss(pred, target, smooth=1e-6):
     pred_flat = pred.view(-1)
     target_flat = target.view(-1)
@@ -37,7 +35,7 @@ def combined_loss(pred, target):
     bce = nn.BCELoss()(pred, target)
     return 0.6 * dice + 0.4 * bce
 
-# --- 新增：计算 Dice 和 IoU 的评估函数 ---
+# 计算 Dice 和 IoU 的评估函数
 def calculate_metrics(pred, target, threshold=0.5):
     # 将概率图转换为二值图 (0或1)
     pred_bin = (pred > threshold).float()
@@ -48,20 +46,22 @@ def calculate_metrics(pred, target, threshold=0.5):
     union = pred_flat.sum() + target_flat.sum()
     
     # Dice Coefficient
-    # 公式: 2 * Intersection / (Sum of pixels)
     dice = (2. * intersection + 1e-6) / (union + 1e-6)
     
     # IoU (Intersection over Union)
-    # 公式: Intersection / (Union - Intersection)
     iou = (intersection + 1e-6) / (union - intersection + 1e-6)
     
     return dice.item(), iou.item()
 
 # 训练函数
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
-    best_val_dice = 0.0 # 修改为根据 Dice 保存最佳模型
+    best_val_dice = 0.0  # 根据 Dice 保存最佳模型
     patience = 8
     patience_counter = 0
+
+    # 确保保存权重的文件夹存在
+    os.makedirs('checkpoints', exist_ok=True)
+    save_path = 'checkpoints/best_model_unet.pth'
 
     for epoch in range(num_epochs):
         model.train()
@@ -81,6 +81,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             optimizer.step()
             
             train_loss += loss.item()
+            
             # 计算指标
             acc = (outputs.round() == masks).float().mean().item()
             dice, iou = calculate_metrics(outputs, masks)
@@ -126,12 +127,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             {
                 "train/loss": train_loss,
                 "train/acc": train_acc,
-                "train/dice": train_dice, # 新增
-                "train/iou": train_iou,   # 新增
+                "train/dice": train_dice,
+                "train/iou": train_iou,
                 "val/loss": val_loss,
                 "val/acc": val_acc,
-                "val/dice": val_dice,     # 新增
-                "val/iou": val_iou,       # 新增
+                "val/dice": val_dice,
+                "val/iou": val_iou,
             },
             step=epoch+1
         )
@@ -140,28 +141,29 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f'Train - Loss: {train_loss:.4f}, Dice: {train_dice:.4f}, IoU: {train_iou:.4f}')
         print(f'Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}, IoU: {val_iou:.4f}')
         
-        # 早停策略 (修改为监控 Dice，Dice 越高越好)
+        # 早停策略 (监控 Val Dice)
         if val_dice > best_val_dice:
             best_val_dice = val_dice
             patience_counter = 0
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f"✅ New best model saved! (Val Dice: {val_dice:.4f})")
+            torch.save(model.state_dict(), save_path)
+            print(f"✅ New best model saved to {save_path}! (Val Dice: {val_dice:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print("Early stopping triggered")
+                print(f"Early stopping triggered at epoch {epoch+1}")
                 break
 
 def main():
-    # 初始化 SwanLab
+    # 初始化 SwanLab (修改为 Baseline 的专属实验名称)
     swanlab.init(
         project="Unet-Medical-Segmentation",
-        experiment_name="Improved-Training-Metrics",
+        experiment_name="Baseline-UNet-Training",
         config={
-            "batch_size": 4,  # 根据您的显存调整
+            "batch_size": 4, 
             "learning_rate": 1e-4,
             "num_epochs": 40,
             "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "model_type": "Standard_UNet"
         },
     )
     
@@ -171,10 +173,12 @@ def main():
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Resize((256, 256)),
+        # 注意：此处使用的均值和方差是 ImageNet 的标准值。
+        # 如果是针对脑部 MRI，后续我们可以在 dataset.py 中引入专门的医疗图像归一化或 CLAHE 预处理。
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # 加载COCO对象 (需确保json路径正确)
+    # 加载COCO对象
     train_coco = COCO(train_annotation_file)
     val_coco = COCO(val_annotation_file)
     test_coco = COCO(test_annotation_file)
@@ -187,17 +191,17 @@ def main():
     # 创建数据加载器
     BATCH_SIZE = swanlab.config["batch_size"]
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
-    # 初始化模型 (这里默认用原始 UNet，如果你想跑改进版，请替换为 ImprovedUNet)
-    #model = UNet(n_filters=32).to(device) 
-    model = ImprovedUNet(n_channels=3, n_classes=1).to(device) # 如果你要跑改进版，取消这行注释
-    
+    # 初始化基线模型
+    print("🚀 Initializing Baseline UNet...")
+    model = UNet(n_channels=3, n_classes=1).to(device) 
     
     # 计算参数量
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"\n🔥 当前模型参数量: {total_params/1e6:.4f} M (百万)\n")
+    print(f"🔥 当前 Baseline 模型参数量: {total_params/1e6:.4f} M\n")
+    
     optimizer = optim.Adam(model.parameters(), lr=swanlab.config["learning_rate"])
     
     # 开始训练
@@ -210,10 +214,6 @@ def main():
         num_epochs=swanlab.config["num_epochs"],
         device=device,
     )
-    
-    # ... (后续的可视化代码可以保留) ...
-
-# ... (visualize_predictions 函数保持不变) ...
 
 if __name__ == '__main__':
     main()

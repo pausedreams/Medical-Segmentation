@@ -1,129 +1,154 @@
-import torch
-import torchvision.transforms as transforms
-from PIL import Image
-import matplotlib.pyplot as plt
-from net import UNet
-import numpy as np
 import os
-import sys
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+from pycocotools.coco import COCO
+from torch.utils.data import DataLoader
+import random
 
-def load_model(model_path='best_model.pth', device='cuda'):
-    """加载训练好的模型"""
-    try:
-        # 检查文件是否存在
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found at {model_path}")
-            
-        model = UNet(n_filters=32).to(device)
-        # 添加weights_only=True来避免警告
-        state_dict = torch.load(model_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-        model.eval()
-        print(f"Model loaded successfully from {model_path}")
-        return model
-    except Exception as e:
-        print(f"Error loading model: {str(e)}")
-        raise
+# 导入你重命名后的新版模型
+from model_unet import UNet
+from model_mkunet import ImprovedUNet
+from dataset import COCOSegmentationDataset
 
-def preprocess_image(image_path):
-    """预处理输入图像"""
-    # 读取原始图像
-    image = Image.open(image_path).convert('RGB')
-    
-    # 保存调整大小后的原始图像用于显示
-    display_image = image.resize((256, 256), Image.Resampling.BILINEAR)
-    
-    # 模型输入的预处理
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((256, 256)),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    image_tensor = transform(image)
-    return image_tensor.unsqueeze(0), display_image
+# ================= 配置区域 =================
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def predict_mask(model, image_tensor, device='cuda', threshold=0.5):
-    """预测分割掩码"""
+# 测试集路径
+TEST_IMG_DIR = './dataset/Brain_Tumor_Image_DataSet/test'
+TEST_ANN_FILE = './dataset/Brain_Tumor_Image_DataSet/test/_annotations.coco.json'
+
+# 🔥 选择你想预测和评估的模型 (修改这里切换)
+# 选项: 'baseline' (标准U-Net) 或 'innovation' (改进的MK-UNet)
+MODEL_TYPE = 'innovation' 
+
+if MODEL_TYPE == 'baseline':
+    MODEL_PATH = 'checkpoints/best_model_unet.pth'
+    print("🚀 正在初始化基线模型 (Baseline U-Net)...")
+    model = UNet(n_channels=3, n_classes=1).to(DEVICE)
+else:
+    MODEL_PATH = 'checkpoints/best_model_mkunet.pth'
+    print("🚀 正在初始化创新模型 (Improved MK-UNet)...")
+    model = ImprovedUNet(n_channels=3, n_classes=1).to(DEVICE)
+# ===========================================
+
+# --- 计算 Dice 和 IoU 的评估函数 ---
+def calculate_metrics(pred, target, threshold=0.5):
+    """计算单批次的 Dice 系数和 IoU"""
+    pred_bin = (pred > threshold).float()
+    pred_flat = pred_bin.view(-1)
+    target_flat = target.view(-1)
+    
+    intersection = (pred_flat * target_flat).sum()
+    union = pred_flat.sum() + target_flat.sum()
+    
+    dice = (2. * intersection + 1e-6) / (union + 1e-6)
+    iou = (intersection + 1e-6) / (union - intersection + 1e-6)
+    
+    return dice.item(), iou.item()
+
+def evaluate_and_visualize(model, dataset, device, num_samples=6):
+    print(f"\n🔍 正在加载权重文件: {MODEL_PATH}")
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"❌ 找不到权重文件 {MODEL_PATH}！")
+    
+    # 加载权重并开启推理模式
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+    print("✅ 权重加载成功！\n")
+
+    # =========================================
+    # 1. 核心改进：全测试集定量评估 (计算 Test Dice/IoU)
+    # =========================================
+    print("📊 正在对整个测试集进行定量指标评估，请稍候...")
+    test_loader = DataLoader(dataset, batch_size=4, shuffle=False)
+    
+    test_dice_sum = 0.0
+    test_iou_sum = 0.0
+    
     with torch.no_grad():
-        image_tensor = image_tensor.to(device)
-        prediction = model(image_tensor)
-        prediction = (prediction > threshold).float()
-    return prediction
+        for images, masks in test_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            outputs = model(images)
+            
+            dice, iou = calculate_metrics(outputs, masks)
+            test_dice_sum += dice
+            test_iou_sum += iou
+            
+    avg_test_dice = test_dice_sum / len(test_loader)
+    avg_test_iou = test_iou_sum / len(test_loader)
+    
+    print("=" * 45)
+    print(f"🏆 【{MODEL_TYPE.upper()} 模型】最终测试集成绩单:")
+    print(f"   Test - Dice: {avg_test_dice:.4f} | IoU: {avg_test_iou:.4f}")
+    print("=" * 45)
 
-def visualize_result(original_image, predicted_mask):
-    """可视化预测结果"""
-    plt.figure(figsize=(12, 6))
-    plt.suptitle('Predictions')
-    
-    # 显示原始图像
-    plt.subplot(131)
-    plt.imshow(original_image)
-    plt.title('Original Image')
-    plt.axis('off')
-    
-    # 显示预测掩码
-    plt.subplot(132)
-    plt.imshow(predicted_mask.squeeze(), cmap='gray')
-    plt.title('Predicted Mask')
-    plt.axis('off')
-    
-    # 显示叠加结果
-    plt.subplot(133)
-    plt.imshow(np.array(original_image))  # 转换为numpy数组
-    plt.imshow(predicted_mask.squeeze(), cmap='Reds', alpha=0.3)
-    plt.title('Overlay')
-    plt.axis('off')
-        
+    # =========================================
+    # 2. 定性评估：生成 6张图 拼接的大矩阵图
+    # =========================================
+    print(f"\n📸 正在抽取 {num_samples} 张样本生成【统一可视化大图】...")
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+    # 随机抽取索引
+    indices = random.sample(range(len(dataset)), num_samples)
+
+    # 🔥 创建一个大画布：num_samples 行，3 列
+    # 动态调整高度：每行给 4 英寸的高度，保证图片不被挤压
+    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4 * num_samples))
+
+    with torch.no_grad():
+        for row_idx, data_idx in enumerate(indices):
+            image_tensor, mask_tensor = dataset[data_idx]
+            input_tensor = image_tensor.unsqueeze(0).to(device)
+
+            pred_tensor = model(input_tensor)
+            pred_binary = (pred_tensor.squeeze().cpu() > 0.5).float().numpy()
+
+            # 还原图像
+            img_vis = image_tensor.cpu() * std + mean
+            img_vis = torch.clamp(img_vis, 0, 1).permute(1, 2, 0).numpy()
+            mask_vis = mask_tensor.squeeze().cpu().numpy()
+
+            # 在对应的子图位置进行绘制
+            # 第 1 列：原图
+            axes[row_idx, 0].imshow(img_vis)
+            axes[row_idx, 0].axis('off')
+            if row_idx == 0:
+                axes[row_idx, 0].set_title("Test Image (CLAHE)", fontsize=14, pad=10)
+
+            # 第 2 列：金标准
+            axes[row_idx, 1].imshow(mask_vis, cmap='gray')
+            axes[row_idx, 1].axis('off')
+            if row_idx == 0:
+                axes[row_idx, 1].set_title("Ground Truth", fontsize=14, pad=10)
+
+            # 第 3 列：模型预测
+            axes[row_idx, 2].imshow(pred_binary, cmap='gray')
+            axes[row_idx, 2].axis('off')
+            if row_idx == 0:
+                axes[row_idx, 2].set_title(f"Prediction ({MODEL_TYPE.upper()})", fontsize=14, pad=10)
+
+    # 调整布局间距
     plt.tight_layout()
-    plt.savefig('./predictions.png')
-    print("Visualization saved as predictions.png")
+    
+    # 🔥 自动保存为高清 PNG 图片 (分辨率300dpi)，可以直接用于写论文
+    save_filename = f"{MODEL_TYPE}_predictions_grid.png"
+    plt.savefig(save_filename, dpi=300, bbox_inches='tight')
+    print(f"\n🎉 论文配图已成功保存为当前目录下的: 【{save_filename}】")
+    
+    # 弹出展示窗口
+    plt.show()
 
 def main():
-    # 设置设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print("📊 正在初始化测试数据集 (自带 CLAHE 处理)...")
+    test_coco = COCO(TEST_ANN_FILE)
+    test_dataset = COCOSegmentationDataset(test_coco, TEST_IMG_DIR)
     
-    try:
-        # 加载模型
-        model_path = "./best_model.pth"  # 确保这个路径是正确的
-        print(f"Attempting to load model from: {model_path}")
-        model = load_model(model_path, device)
-        
-        # 处理单张图像：优先使用命令行指定的图片路径，否则从实际测试目录中选择一个存在的文件
-        if len(sys.argv) > 1:
-            image_path = sys.argv[1]
-            if not os.path.exists(image_path):
-                raise FileNotFoundError(f"Image file not found at {image_path}")
-        else:
-            test_dir = './dataset/Brain_Tumor_Image_DataSet/test'
-            if not os.path.exists(test_dir):
-                raise FileNotFoundError(f"Test directory not found at {test_dir}")
-
-            candidates = [f for f in os.listdir(test_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-            if not candidates:
-                raise FileNotFoundError(f"No image files found in {test_dir}")
-
-            # 选择第一个图片进行预测（可改为随机或接受索引参数）
-            image_path = os.path.join(test_dir, candidates[0])
-
-        print(f"Processing image: {image_path}")
-        image_tensor, original_image = preprocess_image(image_path)
-        
-        # 预测
-        predicted_mask = predict_mask(model, image_tensor, device)
-        
-        # 将预测结果转回CPU并转换为numpy数组
-        predicted_mask = predicted_mask.cpu().numpy()
-        
-        # 可视化结果
-        print("Generating visualization...")
-        visualize_result(original_image, predicted_mask)
-        print("Results saved to predictions.png")
-        
-    except Exception as e:
-        print(f"Error during prediction: {str(e)}")
-        raise
+    # 执行评估与可视化，num_samples 改为 6
+    evaluate_and_visualize(model, test_dataset, DEVICE, num_samples=6)
 
 if __name__ == '__main__':
     main()
